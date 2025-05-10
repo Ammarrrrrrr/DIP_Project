@@ -11,27 +11,69 @@ import time
 
 def preprocess_image(image):
     """Preprocess the image for better handwritten text recognition."""
-    # Convert PIL Image to OpenCV format
+    # Convert PIL Image to numpy array
     img = np.array(image)
     
-    # Convert to grayscale if image is colored
+    # Convert to grayscale if image is colored - using vectorized operations
     if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        img = np.dot(img[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
     
-    # Apply adaptive thresholding
-    img = cv2.adaptiveThreshold(
-        img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 11, 2
-    )
+    # Optimized adaptive thresholding using vectorized operations
+    def manual_adaptive_threshold(img, block_size=11, C=2):
+        height, width = img.shape
+        result = np.zeros_like(img)
+        
+        # Use numpy's stride tricks for efficient block processing
+        from numpy.lib.stride_tricks import sliding_window_view
+        blocks = sliding_window_view(img, (block_size, block_size))
+        
+        # Calculate means for all blocks at once
+        means = np.mean(blocks, axis=(2, 3))
+        
+        # Apply threshold using vectorized operations
+        result[block_size//2:-(block_size//2), block_size//2:-(block_size//2)] = \
+            (img[block_size//2:-(block_size//2), block_size//2:-(block_size//2)] > (means - C)) * 255
+        
+        return result
     
-    # Denoise the image
-    img = cv2.fastNlMeansDenoising(img)
+    # Optimized median filter using scipy's implementation
+    from scipy.ndimage import median_filter
+    def manual_median_filter(img, kernel_size=3):
+        return median_filter(img, size=kernel_size)
     
-    # Enhance contrast
-    img = cv2.equalizeHist(img)
+    # Optimized histogram equalization using numpy operations
+    def manual_histogram_equalization(img):
+        # Calculate histogram using numpy's bincount
+        hist = np.bincount(img.ravel(), minlength=256)
+        
+        # Calculate cumulative distribution function
+        cdf = np.cumsum(hist)
+        cdf_normalized = cdf * 255 / cdf[-1]
+        
+        # Apply equalization using numpy's vectorized operations
+        return cdf_normalized[img].astype(np.uint8)
     
-    # Convert back to PIL Image
-    return Image.fromarray(img)
+    # Apply preprocessing steps and store intermediate results
+    with st.spinner('Converting to grayscale...'):
+        grayscale = img.copy()
+    
+    with st.spinner('Applying adaptive thresholding...'):
+        thresholded = manual_adaptive_threshold(grayscale)
+    
+    with st.spinner('Applying denoising...'):
+        denoised = manual_median_filter(thresholded)
+    
+    with st.spinner('Enhancing contrast...'):
+        enhanced = manual_histogram_equalization(denoised)
+    
+    # Return all stages for visualization
+    return {
+        'original': Image.fromarray(img),
+        'grayscale': Image.fromarray(grayscale),
+        'thresholded': Image.fromarray(thresholded),
+        'denoised': Image.fromarray(denoised),
+        'enhanced': Image.fromarray(enhanced)
+    }
 
 SYSTEM_PROMPT = """You are a highly advanced OCR system specialized in handwritten text recognition. Your task is to accurately transcribe all visible handwritten text from the provided image. 
 Follow these detailed guidelines strictly to ensure precise and natural transcription:
@@ -67,8 +109,15 @@ Follow these detailed guidelines strictly to ensure precise and natural transcri
 
 def encode_image_to_base64(image_path):
     """Convert an image file to a base64 encoded string."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    try:
+        with open(image_path, "rb") as image_file:
+            image_data = image_file.read()
+            base64_data = base64.b64encode(image_data).decode('utf-8')
+            print(f"Successfully encoded image to base64")
+            return base64_data
+    except Exception as e:
+        print(f"Error encoding image: {str(e)}")
+        raise
 
 def parse_response(response_text):
     """Parse the response text from the model."""
@@ -94,10 +143,26 @@ def parse_response(response_text):
 
 def perform_ocr(image_path):
     """Perform OCR on the given image using Llama 3.2-Vision."""
-    base64_image = encode_image_to_base64(image_path)
-    response = requests.post(
-        "http://localhost:11434/api/chat",
-        json={
+    try:
+        # Debug: Print image path
+        print(f"Processing image: {image_path}")
+        
+        # Check if image exists
+        if not os.path.exists(image_path):
+            st.error(f"Image file not found: {image_path}")
+            return None
+            
+        # Debug: Print image size
+        image_size = os.path.getsize(image_path)
+        print(f"Image size: {image_size} bytes")
+        
+        # Encode image
+        with st.spinner('Encoding image...'):
+            base64_image = encode_image_to_base64(image_path)
+            print(f"Base64 image length: {len(base64_image)}")
+        
+        # Prepare request
+        request_data = {
             "model": "llama3.2-vision",
             "messages": [
                 {
@@ -107,11 +172,36 @@ def perform_ocr(image_path):
                 },
             ],
         }
-    )
-    if response.status_code == 200:
-        return parse_response(response.text)
-    else:
-        st.error(f"Error: {response.status_code} - {response.text}")
+        
+        # Debug: Print request URL
+        print("Sending request to: http://localhost:11434/api/chat")
+        
+        # Send request with progress
+        with st.spinner('Sending request to AI model...'):
+            response = requests.post(
+                "http://localhost:11434/api/chat",
+                json=request_data,
+                timeout=30  # Add timeout
+            )
+        
+        # Debug: Print response status
+        print(f"Response status code: {response.status_code}")
+        
+        if response.status_code == 200:
+            with st.spinner('Processing AI response...'):
+                result = parse_response(response.text)
+                print(f"Parsed result: {result[:100]}...")  # Print first 100 chars
+                return result
+        else:
+            error_msg = f"Error: {response.status_code} - {response.text}"
+            print(error_msg)
+            st.error(error_msg)
+            return None
+            
+    except Exception as e:
+        error_msg = f"Error during OCR processing: {str(e)}"
+        print(error_msg)
+        st.error(error_msg)
         return None
 
 def calculate_metrics(predicted_text, ground_truth):
@@ -178,49 +268,52 @@ def main():
     if uploaded_file is not None:
         os.makedirs("temp", exist_ok=True)
         
-        with open(os.path.join("temp", uploaded_file.name), "wb") as f:
+        # Save uploaded file
+        temp_path = os.path.join("temp", uploaded_file.name)
+        with open(temp_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
             image_path = f.name
         
         # Load and validate image size
-        original_image = Image.open(image_path)
-        original_image = validate_image_size(original_image)
-        processed_image = preprocess_image(original_image)
+        with st.spinner('Loading and validating image...'):
+            original_image = Image.open(image_path)
+            original_image = validate_image_size(original_image)
         
-        # Display both original and processed images
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(original_image, caption="Original Image")
-        with col2:
-            st.image(processed_image, caption="Preprocessed Image")
+        # Get all preprocessing stages
+        processed_stages = preprocess_image(original_image)
         
-        if st.button("Run Handwritten Text Recognition"):
-            start_time = time.time()
+        # Display all preprocessing stages
+        st.subheader("Image Preprocessing Stages")
+        cols = st.columns(5)
+        stages = ['original', 'grayscale', 'thresholded', 'denoised', 'enhanced']
+        for col, stage in zip(cols, stages):
+            with col:
+                st.image(processed_stages[stage], caption=stage.capitalize())
+        
+        # Save processed image temporarily
+        processed_path = os.path.join("temp", "processed_" + uploaded_file.name)
+        processed_stages['enhanced'].save(processed_path)
+        
+        # Process with AI
+        initial_result = perform_ocr(processed_path)
             
-            # Save processed image temporarily
-            processed_path = os.path.join("temp", "processed_" + uploaded_file.name)
-            processed_image.save(processed_path)
+        if initial_result:
+            st.subheader("Recognition Result:")
+            st.text(initial_result.replace("\n", " "))
             
-            initial_result = perform_ocr(processed_path)
-            processing_time = time.time() - start_time
-            
-            if initial_result:
-                st.subheader("Recognition Result:")
-                st.text(initial_result.replace("\n", " "))
-                
-                # Display performance metrics
-                st.subheader("Performance Metrics:")
-                metrics = {
-                    'Processing Time': f"{processing_time:.2f} seconds",
-                    'Image Size': f"{original_image.size[0]}x{original_image.size[1]} pixels"
-                }
-                st.json(metrics)
-            
-            # Clean up temporary files
-            try:
-                os.remove(processed_path)
-            except:
-                pass
+            # Display performance metrics
+            st.subheader("Performance Metrics:")
+            metrics = {
+                'Image Size': f"{original_image.size[0]}x{original_image.size[1]} pixels",
+                'File Size': f"{os.path.getsize(processed_path) / 1024:.2f} KB"
+            }
+            st.json(metrics)
+        
+        # Clean up temporary files
+        try:
+            os.remove(processed_path)
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
